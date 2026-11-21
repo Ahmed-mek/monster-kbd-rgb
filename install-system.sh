@@ -19,7 +19,13 @@ rm -rf "/usr/src/monster-kbd-$VER"
 install -d "/usr/src/monster-kbd-$VER"
 install -m644 "$HERE"/driver/{monster_kbd.c,Makefile,dkms.conf} "/usr/src/monster-kbd-$VER/"
 dkms add "monster-kbd/$VER"
-dkms install "monster-kbd/$VER"
+# Build for every installed kernel that has headers, not only the running one,
+# so a kernel installed before this script (and booted later) also gets it.
+for k in /lib/modules/*; do
+	k=$(basename "$k")
+	[ -e "/lib/modules/$k/build" ] || continue
+	dkms install "monster-kbd/$VER" -k "$k" || echo "warning: build failed for $k"
+done
 
 echo "== 3/5 autoload + udev rule"
 install -m644 "$HERE/modules-load/monster-kbd.conf" /etc/modules-load.d/monster-kbd.conf
@@ -37,7 +43,7 @@ if ! modprobe monster_kbd; then
 	echo "driver did not load: see 'sudo dmesg | grep monster_kbd'"
 	exit 1
 fi
-sleep 1
+udevadm settle
 ls -l /sys/class/leds/monster::kbd_backlight/{color,brightness}
 echo
 echo "done. Now run ./install-user.sh as your normal user (without sudo)."

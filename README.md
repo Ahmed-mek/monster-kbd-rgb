@@ -57,6 +57,11 @@ sudo ./install-system.sh     # DKMS driver, autoload, udev rule, effects service
 Log out and back in (Wayland loads new extensions only at login).
 Your user must be in the `plugdev` group (default on Ubuntu desktop).
 
+The GNOME extension is also on
+[extensions.gnome.org](https://extensions.gnome.org/extension/11895/monster-keyboard-rgb/). You can install it from there instead of
+running `./install-user.sh`, but you still need `sudo ./install-system.sh` for
+the driver.
+
 ### Uninstall
 
 ```bash
@@ -121,6 +126,10 @@ sudo ./install-system.sh
 
 بعدها اعمل تسجيل خروج ودخول، وهتلاقي زرار **Keyboard** في القايمة اللي
 فوق على اليمين، وفيه التأثيرات والألوان.
+
+الإضافة موجودة كمان على [extensions.gnome.org](https://extensions.gnome.org/extension/11895/monster-keyboard-rgb/)، وتقدر تسطّبها من هناك
+بدل `./install-user.sh`. بس لازم تشغّل `sudo ./install-system.sh` الأول علشان
+الدرايفر.
 
 ### حدود الهاردوير
 

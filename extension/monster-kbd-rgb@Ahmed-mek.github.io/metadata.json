@@ -1,10 +1,10 @@
 {
   "uuid": "monster-kbd-rgb@Ahmed-mek.github.io",
   "name": "Monster Keyboard RGB",
-  "description": "Color and effects for the Monster TULPAR / Uniwill single-zone RGB keyboard (needs the monster_kbd driver).",
+  "description": "Keyboard RGB color and lighting effects in Quick Settings for the MONSTER TULPAR T7 V20.2 (Uniwill GK7MR0R) single-zone RGB keyboard.\n\nREQUIRES the monster_kbd kernel driver and the monster-kbd-fx helper, which this extension does not install. Install them first from the GitHub page (sudo ./install-system.sh). Without them the toggle shows \"Driver not loaded\".\n\nEffects: rainbow, breathing, fire, aurora, ocean, heartbeat, random, party, police, CPU load, CPU temperature, battery level. Static colors: 9 presets.\n\nThe keyboard is a single zone and the embedded controller accepts about two color changes per second, so there are no per-key or perfectly smooth effects.\n\nUnofficial project, not affiliated with MONSTER or Uniwill. Only tested on the model above.",
   "shell-version": [
     "50"
   ],
-  "version": 1,
-  "url": "https://github.com/Ahmed-mek/monster-kbd-rgb"
+  "url": "https://github.com/Ahmed-mek/monster-kbd-rgb",
+  "version-name": "1.0"
 }

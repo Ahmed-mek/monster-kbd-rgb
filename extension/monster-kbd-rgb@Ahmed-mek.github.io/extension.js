@@ -132,11 +132,21 @@ class KbdToggle extends QuickMenuToggle {
     }
 
     _queue(fn) {
-        this._busy = this._busy.then(fn).catch(e => {
+        this._busy = this._busy.then(() => {
+            if (!this._destroyed)
+                return fn();
+            return undefined;
+        }).catch(e => {
             console.error(`monster-kbd: ${e.message}`);
-            this.subtitle = 'Error, see journal';
+            if (!this._destroyed)
+                this.subtitle = 'Error, see journal';
         });
         return this._busy;
+    }
+
+    destroy() {
+        this._destroyed = true;
+        super.destroy();
     }
 
     async _stopEffects() {
@@ -237,9 +247,15 @@ export default class MonsterKbdExtension extends Extension {
     }
 
     disable() {
-        // Leave any running effect service alone: it is a normal user
-        // service and keeps working on the lock screen.
         this._indicator?.destroy();
         this._indicator = null;
+        // Stop any effect this extension started. It is started again from
+        // the saved state on the next enable (login / unlock).
+        try {
+            Gio.Subprocess.new(['systemctl', '--user', 'stop', 'monster-kbd-fx@*.service'],
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
+        } catch (e) {
+            console.error(`monster-kbd: ${e.message}`);
+        }
     }
 }

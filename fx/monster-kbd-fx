@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""
+monster-kbd-fx - software color effects for the Monster/Uniwill single-zone
+RGB keyboard, through the monster_kbd driver.
+
+Hardware limits (measured): the EC takes a new color about twice a second and
+the whole keyboard is one zone. So effects are built from discrete steps at
+<= 2 updates/s. Effects that look good with sharp steps (fire, police,
+heartbeat, random) suit this hardware better than long fades.
+
+Usage (root, because it writes sysfs):
+  sudo python3 monster-kbd-fx.py <effect> [options]
+  sudo python3 monster-kbd-fx.py demo          # 20 s of each effect
+  sudo python3 monster-kbd-fx.py --list
+  Ctrl+C restores the color that was set before starting.
+
+Status effects (update every few seconds, light EC load):
+  cpu      green -> yellow -> red with CPU load
+  temp     blue -> green -> red with CPU package temperature (40..90 C)
+  battery  red (low) -> green (full); pulses when below 15 %
+"""
+import argparse
+import colorsys
+import glob
+import math
+import random
+import signal
+import sys
+import time
+
+LED = "/sys/class/leds/monster::kbd_backlight"
+CH_MAX = 50
+TICK = 0.5              # seconds between EC updates, hard floor
+MAX_ERRORS = 3
+
+
+# ---------------------------------------------------------------- helpers
+
+def clamp(v):
+    return max(0, min(CH_MAX, int(round(v))))
+
+
+def hsv(h, s=1.0, v=1.0):
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+    return (clamp(r * CH_MAX), clamp(g * CH_MAX), clamp(b * CH_MAX))
+
+
+def scale(c, k):
+    return tuple(clamp(x * k) for x in c)
+
+
+def lerp(a, b, f):
+    return tuple(clamp(a[i] + (b[i] - a[i]) * f) for i in range(3))
+
+
+def ramp(stops, x):
+    """stops: [(pos, rgb), ...] sorted, x in 0..1"""
+    x = max(0.0, min(1.0, x))
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if x <= p1:
+            return lerp(c0, c1, (x - p0) / (p1 - p0) if p1 > p0 else 0)
+    return stops[-1][1]
+
+
+def read_color():
+    with open(f"{LED}/color") as f:
+        return tuple(int(x) for x in f.read().split())
+
+
+def write_color(rgb):
+    # The EC replaces 0 0 0 with its default color, so never send pure black.
+    if not any(rgb):
+        rgb = (1, 1, 1)
+    with open(f"{LED}/color", "w") as f:
+        f.write("%d %d %d\n" % rgb)
+
+
+# Each effect is a generator yielding one color per TICK.
+
+# ---------------------------------------------------------------- effects
+
+def fx_fire(_):
+    """Warm flicker: red/orange/amber with random intensity."""
+    while True:
+        h = random.uniform(0.0, 0.09)           # red .. orange-yellow
+        v = random.choice([1.0, 1.0, 0.85, 0.7, 0.5])
+        yield hsv(h, 1.0, v)
+
+
+def fx_police(_):
+    """Red / blue strobe."""
+    pat = [(50, 0, 0), (50, 0, 0), (2, 0, 0), (50, 0, 0),
+           (0, 0, 50), (0, 0, 50), (0, 0, 2), (0, 0, 50)]
+    while True:
+        yield from pat
+
+
+def fx_heartbeat(a):
+    """Lub-dub beat, then rest."""
+    c = a.color or (50, 0, 6)
+    dim = scale(c, 0.06)
+    while True:
+        yield from [c, scale(c, 0.35), c, dim, dim, dim]
+
+
+def fx_random(a):
+    """A new vivid random color every --hold seconds."""
+    hold = max(1, int(a.hold / TICK))
+    h = random.random()
+    while True:
+        h = (h + random.uniform(0.2, 0.8)) % 1.0  # always far from previous
+        for _ in range(hold):
+            yield hsv(h)
+
+
+def fx_aurora(_):
+    """Drift through greens, teals, blues and purples."""
+    h = 0.45
+    while True:
+        h += random.uniform(-0.03, 0.03)
+        h = min(0.85, max(0.30, h))
+        yield hsv(h, 1.0, random.uniform(0.75, 1.0))
+
+
+def fx_ocean(_):
+    """Slow waves of deep blue and cyan."""
+    t = 0
+    while True:
+        t += 1
+        x = 0.5 + 0.5 * math.sin(t / 6.0)
+        yield ramp([(0, (0, 4, 30)), (0.6, (0, 25, 50)), (1, (10, 50, 50))], x)
+
+
+def fx_party(_):
+    """Fast jumps between saturated colors."""
+    palette = [hsv(i / 7) for i in range(7)] + [(50, 50, 50)]
+    while True:
+        yield random.choice(palette)
+
+
+def fx_rainbow(a):
+    """Step around the color wheel (coarse steps look intentional)."""
+    steps = 12
+    hold = max(1, int(a.hold / TICK))
+    i = 0
+    while True:
+        for _ in range(hold):
+            yield hsv(i / steps)
+        i += 1
+
+
+def fx_breathe(a):
+    """Fade one color in and out (--color, --period)."""
+    c = a.color or a.orig
+    n = max(4, int(a.period / TICK))
+    while True:
+        for i in range(n):
+            k = 0.06 + 0.94 * (0.5 - 0.5 * math.cos(2 * math.pi * i / n))
+            yield scale(c, k)
+
+
+# -------------------------------------------------------- status effects
+
+def _cpu_times():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    idle = v[3] + v[4]
+    return sum(v), idle
+
+
+def fx_cpu(a):
+    """Green -> yellow -> red with CPU load."""
+    stops = [(0, (0, 50, 0)), (0.5, (50, 40, 0)), (1, (50, 0, 0))]
+    tot0, idle0 = _cpu_times()
+    every = max(1, int(a.hold / TICK))
+    col = stops[0][1]
+    n = 0
+    while True:
+        if n % every == 0:
+            tot, idle = _cpu_times()
+            dt = tot - tot0
+            load = 1.0 - (idle - idle0) / dt if dt else 0.0
+            tot0, idle0 = tot, idle
+            col = ramp(stops, load)
+        n += 1
+        yield col
+
+
+def _pkg_temp():
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(f"{h}/name").read().strip() == "coretemp":
+                return int(open(f"{h}/temp1_input").read()) / 1000.0
+        except OSError:
+            pass
+    return None
+
+
+def fx_temp(a):
+    """Blue -> green -> red with CPU temperature (40..90 C)."""
+    stops = [(0, (0, 10, 50)), (0.4, (0, 50, 10)), (0.7, (50, 40, 0)),
+             (1, (50, 0, 0))]
+    every = max(1, int(a.hold / TICK))
+    col = stops[0][1]
+    n = 0
+    while True:
+        if n % every == 0:
+            t = _pkg_temp()
+            if t is not None:
+                col = ramp(stops, (t - 40.0) / 50.0)
+        n += 1
+        yield col
+
+
+def _battery():
+    for b in glob.glob("/sys/class/power_supply/BAT*"):
+        try:
+            cap = int(open(f"{b}/capacity").read())
+            st = open(f"{b}/status").read().strip()
+            return cap, st
+        except OSError:
+            pass
+    return None, None
+
+
+def fx_battery(a):
+    """Red (low) -> green (full); pulses below 15 % on battery."""
+    stops = [(0, (50, 0, 0)), (0.3, (50, 30, 0)), (1, (0, 50, 0))]
+    every = max(1, int(10 / TICK))
+    cap, st = _battery()
+    n = 0
+    while True:
+        if n % every == 0:
+            cap, st = _battery()
+        n += 1
+        if cap is None:
+            yield (20, 20, 20)
+            continue
+        col = ramp(stops, cap / 100.0)
+        if cap < 15 and st != "Charging" and n % 2:
+            col = scale(col, 0.1)
+        yield col
+
+
+EFFECTS = {
+    "fire": fx_fire, "police": fx_police, "heartbeat": fx_heartbeat,
+    "random": fx_random, "aurora": fx_aurora, "ocean": fx_ocean,
+    "party": fx_party, "rainbow": fx_rainbow, "breathe": fx_breathe,
+    "cpu": fx_cpu, "temp": fx_temp, "battery": fx_battery,
+}
+
+
+def fx_demo(a):
+    """20 seconds of each effect."""
+    for name in ["fire", "police", "heartbeat", "aurora", "ocean", "party",
+                 "random", "rainbow", "breathe", "cpu", "temp", "battery"]:
+        print(f"demo: {name}", flush=True)
+        g = EFFECTS[name](a)
+        for _ in range(int(20 / TICK)):
+            yield next(g)
+    print("demo done", flush=True)
+
+
+EFFECTS["demo"] = fx_demo
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("effect", nargs="?", choices=sorted(EFFECTS) + ["static"])
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--color", nargs=3, type=int, default=None,
+                    help="base color R G B (0..50) for breathe/heartbeat")
+    ap.add_argument("--period", type=float, default=6.0,
+                    help="breathe period, seconds")
+    ap.add_argument("--hold", type=float, default=2.0,
+                    help="seconds per step for random/rainbow, sample rate for cpu/temp")
+    a = ap.parse_args()
+
+    if a.list or not a.effect:
+        for k in sorted(EFFECTS):
+            print(f"  {k:10s} {(EFFECTS[k].__doc__ or '').strip()}")
+        return
+    if a.color and any(c < 0 or c > CH_MAX for c in a.color):
+        ap.error("--color values must be 0..50")
+    if a.color:
+        a.color = tuple(a.color)
+
+    if a.effect == "static":
+        if not a.color:
+            ap.error("static needs --color R G B")
+        write_color(a.color)
+        return
+
+    orig = read_color()
+    a.orig = orig
+
+    def stop(*_, code=0):
+        try:
+            write_color(orig)
+        finally:
+            print(f"\nrestored {orig}", flush=True)
+            sys.exit(code)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    errors, last = 0, None
+    for rgb in EFFECTS[a.effect](a):
+        t = time.monotonic()
+        if rgb != last:
+            try:
+                write_color(rgb)
+                errors, last = 0, rgb
+            except OSError as e:
+                errors += 1
+                print(f"write failed: {e}", file=sys.stderr)
+                if errors >= MAX_ERRORS:
+                    print("too many EC errors, stopping", file=sys.stderr)
+                    stop(code=1)
+        time.sleep(max(0.0, TICK - (time.monotonic() - t)))
+    stop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+{
+  "uuid": "monster-kbd-rgb@Ahmed-mek.github.io",
+  "name": "Monster Keyboard RGB",
+  "description": "Color and effects for the Monster TULPAR / Uniwill single-zone RGB keyboard (needs the monster_kbd driver).",
+  "shell-version": [
+    "50"
+  ],
+  "version": 1,
+  "url": "https://github.com/Ahmed-mek/monster-kbd-rgb"
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Monster keyboard effect: %i
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/bin/monster-kbd-fx %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

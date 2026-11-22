@@ -375,7 +375,10 @@ static int __init monster_kbd_init(void)
 	cdev->max_brightness = MC_MAX;
 	cdev->brightness = MC_MAX;
 	cdev->brightness_set_blocking = mkbd_brightness_set;
-	cdev->groups = mkbd_groups;
+	/*
+	 * Not cdev->groups: led_classdev_multicolor_register() replaces it with
+	 * the multicolor group. Our attributes are added after registration.
+	 */
 	/* keep the light as-is on rmmod instead of forcing it off */
 	cdev->flags = LED_RETAIN_AT_SHUTDOWN;
 
@@ -385,6 +388,15 @@ static int __init monster_kbd_init(void)
 		return ret;
 	}
 
+	ret = sysfs_create_groups(&cdev->dev->kobj, mkbd_groups);
+	if (ret) {
+		led_classdev_multicolor_unregister(&mkbd_mc);
+		platform_device_unregister(mkbd_pdev);
+		return ret;
+	}
+	/* let udev apply permissions to the attributes added above */
+	kobject_uevent(&cdev->dev->kobj, KOBJ_CHANGE);
+
 	pr_info("monster_kbd: loaded as multicolor LED, color %u %u %u\n",
 		rgb[0], rgb[1], rgb[2]);
 	return 0;
@@ -392,6 +404,7 @@ static int __init monster_kbd_init(void)
 
 static void __exit monster_kbd_exit(void)
 {
+	sysfs_remove_groups(&mkbd_mc.led_cdev.dev->kobj, mkbd_groups);
 	led_classdev_multicolor_unregister(&mkbd_mc);
 	platform_device_unregister(mkbd_pdev);
 }

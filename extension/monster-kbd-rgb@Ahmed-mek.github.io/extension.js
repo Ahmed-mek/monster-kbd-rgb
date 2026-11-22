@@ -15,6 +15,9 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 Gio._promisify(Gio.Subprocess.prototype, 'wait_check_async');
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+Gio._promisify(Gio.File.prototype, 'replace_contents_bytes_async', 'replace_contents_finish');
+Gio._promisify(Gio.File.prototype, 'make_directory_async');
 
 const LED = '/sys/class/leds/monster::kbd_backlight';
 const FX = '/usr/local/bin/monster-kbd-fx';
@@ -53,23 +56,28 @@ function statePath() {
     return GLib.build_filenamev([GLib.get_user_config_dir(), 'monster-kbd', 'state.json']);
 }
 
-function loadState() {
+async function loadState() {
     try {
-        const [ok, bytes] = GLib.file_get_contents(statePath());
-        if (ok) {
-            const s = JSON.parse(new TextDecoder().decode(bytes));
-            return {...DEFAULT_STATE, ...s};
-        }
+        const [bytes] = await Gio.File.new_for_path(statePath()).load_contents_async(null);
+        const s = JSON.parse(new TextDecoder().decode(bytes));
+        return {...DEFAULT_STATE, ...s};
     } catch (e) {
         // first run or unreadable: defaults
+        return {...DEFAULT_STATE};
     }
-    return {...DEFAULT_STATE};
 }
 
-function saveState(state) {
-    const p = statePath();
-    GLib.mkdir_with_parents(GLib.path_get_dirname(p), 0o755);
-    GLib.file_set_contents(p, JSON.stringify(state));
+async function saveState(state) {
+    const file = Gio.File.new_for_path(statePath());
+    try {
+        await file.get_parent().make_directory_async(GLib.PRIORITY_DEFAULT, null);
+    } catch (e) {
+        if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.EXISTS))
+            throw e;
+    }
+    const bytes = new GLib.Bytes(new TextEncoder().encode(JSON.stringify(state)));
+    await file.replace_contents_bytes_async(bytes, null, false,
+        Gio.FileCreateFlags.REPLACE_DESTINATION, null);
 }
 
 function driverWritable() {
@@ -91,7 +99,7 @@ class KbdToggle extends QuickMenuToggle {
             toggleMode: true,
         });
 
-        this._state = loadState();
+        this._state = {...DEFAULT_STATE};
         this._busy = Promise.resolve();
 
         this.menu.setHeader(ICON, 'Keyboard RGB', 'Monster TULPAR');
@@ -128,7 +136,13 @@ class KbdToggle extends QuickMenuToggle {
         });
 
         this._sync();
-        this._apply();
+        this._queue(async () => {
+            this._state = await loadState();
+            if (this._destroyed)
+                return;
+            this._sync();
+            this._apply();
+        });
     }
 
     _queue(fn) {
@@ -142,6 +156,11 @@ class KbdToggle extends QuickMenuToggle {
                 this.subtitle = 'Error, see journal';
         });
         return this._busy;
+    }
+
+    _save() {
+        const snapshot = {...this._state};
+        saveState(snapshot).catch(e => console.error(`monster-kbd: saving state: ${e.message}`));
     }
 
     destroy() {
@@ -160,7 +179,7 @@ class KbdToggle extends QuickMenuToggle {
     _setEffect(id) {
         this._state.effect = id;
         this._state.lastEffect = id;
-        saveState(this._state);
+        this._save();
         this._sync();
         this._queue(async () => {
             await this._stopEffects();
@@ -171,7 +190,7 @@ class KbdToggle extends QuickMenuToggle {
     _setColor(rgb) {
         this._state.effect = null;
         this._state.color = rgb;
-        saveState(this._state);
+        this._save();
         this._sync();
         this._queue(async () => {
             await this._stopEffects();

@@ -20,9 +20,13 @@ MONSTER Control Center uses on Windows.
 
 ## What you get
 
-- **`monster_kbd` kernel module** → `/sys/class/leds/monster::kbd_backlight/`
-  - `color` — `R G B`, each `0..50`
-  - `brightness` — `0..10` (software, scales the color)
+- **`monster_kbd` kernel module**, registered as a standard **multicolor LED**
+  (`led-class-multicolor`), so tools that use the kernel LED API can drive it →
+  `/sys/class/leds/monster::kbd_backlight/`
+  - `multi_index` — `red green blue`
+  - `multi_intensity` — `R G B`, each `0..255`
+  - `brightness` — `0..255` (software, scales the color)
+  - `color` — `R G B`, each `0..50` (EC native scale, same state as `multi_intensity`)
   - `hw_level` — read-only, brightness level `0..4` set with the Fn keys
 - **`monster-kbd-fx`** — effects: rainbow, breathe, fire, aurora, ocean,
   heartbeat, random, party, police, and status effects (CPU load, CPU
@@ -72,7 +76,9 @@ sudo ./uninstall-system.sh
 ## Command line
 
 ```bash
-echo "50 0 25" > /sys/class/leds/monster::kbd_backlight/color
+echo "255 0 128" > /sys/class/leds/monster::kbd_backlight/multi_intensity
+echo 128 > /sys/class/leds/monster::kbd_backlight/brightness
+echo "50 0 25" > /sys/class/leds/monster::kbd_backlight/color   # EC scale 0..50
 monster-kbd-fx --list
 monster-kbd-fx fire                 # Ctrl+C restores the previous color
 monster-kbd-fx static --color 0 50 50

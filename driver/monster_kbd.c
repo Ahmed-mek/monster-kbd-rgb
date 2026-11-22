@@ -3,14 +3,21 @@
  * monster_kbd - RGB keyboard backlight for Monster TULPAR T7 V20.2
  * (Uniwill GK7MR0R) via WMI GUID ABBC0F6F-... (\_SB.AMW0.WMBC, method 4).
  *
- * /sys/class/leds/monster::kbd_backlight/
- *   brightness      0..10, software: scales the color written to the EC
- *   max_brightness  10
- *   color           "R G B" base color at full brightness, each 0..50
- *   hw_level        read-only, EC brightness level 0..4 set by the Fn keys
- *                   (EC 0x78C bits 7..5)
+ * Registered as a standard multicolor LED (led-class-multicolor), so any
+ * tool that speaks the kernel LED API can drive it:
  *
- * Effective light = Fn level (EC, hardware) x brightness/10 (this driver).
+ * /sys/class/leds/monster::kbd_backlight/
+ *   brightness       0..255, software: scales the color written to the EC
+ *   max_brightness   255
+ *   multi_index      "red green blue"
+ *   multi_intensity  "R G B", each 0..255 (standard multicolor attribute)
+ *   color            "R G B", each 0..50 (EC native scale, same state as
+ *                    multi_intensity; kept for monster-kbd-fx / the extension)
+ *   hw_level         read-only, EC brightness level 0..4 set by the Fn keys
+ *                    (EC 0x78C bits 7..5)
+ *
+ * EC channel = intensity/255 * brightness/255 * 50.
+ * Effective light = that x the Fn level (EC, hardware).
  *
  * Verified on this machine: writing 0x78C is stored but does NOT change the
  * light (even followed by the 0x767 apply bit), so this driver never writes
@@ -26,6 +33,7 @@
 #include <linux/string.h>
 #include <linux/mutex.h>
 #include <linux/leds.h>
+#include <linux/led-class-multicolor.h>
 #include <linux/platform_device.h>
 #include <linux/bitfield.h>
 #include <linux/math.h>
@@ -46,7 +54,7 @@
 #define EC_KBD_STATUS   0x078C
 #define  KBD_LEVEL      GENMASK(7, 5)
 #define KBD_CH_MAX      50
-#define SW_MAX          10
+#define MC_MAX          255
 
 #define SEL_WRITE       0x00000000
 #define SEL_READ        0x00000100
@@ -70,11 +78,19 @@ MODULE_DEVICE_TABLE(dmi, mkbd_dmi_table);
 
 static DEFINE_MUTEX(ec_lock);
 static struct platform_device *mkbd_pdev;
-static struct led_classdev mkbd_led;
+static struct mc_subled mkbd_subleds[3] = {
+	{ .color_index = LED_COLOR_ID_RED,   .channel = 0 },
+	{ .color_index = LED_COLOR_ID_GREEN, .channel = 1 },
+	{ .color_index = LED_COLOR_ID_BLUE,  .channel = 2 },
+};
+static struct led_classdev_mc mkbd_mc = {
+	.subled_info = mkbd_subleds,
+	.num_colors = ARRAY_SIZE(mkbd_subleds),
+};
 
 /* protected by ec_lock */
-static u8 base_rgb[3];		/* color at full brightness */
-static unsigned int sw_level = SW_MAX;
+static unsigned int intens[3];	/* 0..MC_MAX, color at full brightness */
+static unsigned int sw_level = MC_MAX;
 static u8 hw_rgb[3];		/* last values written to / read from the EC */
 static bool hw_valid;
 
@@ -140,7 +156,12 @@ static int ec_wr(u16 addr, u8 v)
 	return mkbd_wmbc(addr, v, SEL_WRITE, NULL);
 }
 
-/* caller holds ec_lock: write base_rgb scaled by sw_level, then apply */
+static u8 to_ec(unsigned int intensity, unsigned int level)
+{
+	return DIV_ROUND_CLOSEST(intensity * level * KBD_CH_MAX, MC_MAX * MC_MAX);
+}
+
+/* caller holds ec_lock: write intens scaled by sw_level, then apply */
 static int mkbd_push(void)
 {
 	static const u16 ch[3] = { EC_KBD_R, EC_KBD_G, EC_KBD_B };
@@ -155,7 +176,7 @@ static int mkbd_push(void)
 	 * one or two channels per step.
 	 */
 	for (i = 0; i < 3; i++) {
-		u8 v = DIV_ROUND_CLOSEST(base_rgb[i] * sw_level, SW_MAX);
+		u8 v = to_ec(intens[i], sw_level);
 
 		if (hw_valid && hw_rgb[i] == v)
 			continue;
@@ -188,13 +209,20 @@ static int mkbd_push(void)
 
 /* ---- brightness (software) ---- */
 
+/*
+ * Called by the LED core for writes to both `brightness` and
+ * `multi_intensity` (the core stores the new intensities in subled_info
+ * first), so take the color from subled_info here.
+ */
 static int mkbd_brightness_set(struct led_classdev *cdev,
 			       enum led_brightness value)
 {
-	int ret;
+	int i, ret;
 
 	mutex_lock(&ec_lock);
-	sw_level = min_t(unsigned int, value, SW_MAX);
+	sw_level = min_t(unsigned int, value, MC_MAX);
+	for (i = 0; i < 3; i++)
+		intens[i] = min_t(unsigned int, mkbd_subleds[i].intensity, MC_MAX);
 	ret = mkbd_push();
 	mutex_unlock(&ec_lock);
 	return ret;
@@ -208,7 +236,10 @@ static ssize_t color_show(struct device *dev, struct device_attribute *attr,
 	ssize_t n;
 
 	mutex_lock(&ec_lock);
-	n = sysfs_emit(buf, "%u %u %u\n", base_rgb[0], base_rgb[1], base_rgb[2]);
+	n = sysfs_emit(buf, "%u %u %u\n",
+		       DIV_ROUND_CLOSEST(intens[0] * KBD_CH_MAX, MC_MAX),
+		       DIV_ROUND_CLOSEST(intens[1] * KBD_CH_MAX, MC_MAX),
+		       DIV_ROUND_CLOSEST(intens[2] * KBD_CH_MAX, MC_MAX));
 	mutex_unlock(&ec_lock);
 	return n;
 }
@@ -216,20 +247,26 @@ static ssize_t color_show(struct device *dev, struct device_attribute *attr,
 static ssize_t color_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
-	unsigned int r, g, b;
-	int ret;
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+	unsigned int v[3];
+	int i, ret;
 
-	if (sscanf(buf, "%u %u %u", &r, &g, &b) != 3)
+	if (sscanf(buf, "%u %u %u", &v[0], &v[1], &v[2]) != 3)
 		return -EINVAL;
-	if (r > KBD_CH_MAX || g > KBD_CH_MAX || b > KBD_CH_MAX)
-		return -ERANGE;
+	for (i = 0; i < 3; i++)
+		if (v[i] > KBD_CH_MAX)
+			return -ERANGE;
 
+	/* led_access keeps us in sync with multi_intensity writes */
+	mutex_lock(&cdev->led_access);
 	mutex_lock(&ec_lock);
-	base_rgb[0] = r;
-	base_rgb[1] = g;
-	base_rgb[2] = b;
+	for (i = 0; i < 3; i++) {
+		intens[i] = DIV_ROUND_CLOSEST(v[i] * MC_MAX, KBD_CH_MAX);
+		mkbd_subleds[i].intensity = intens[i];
+	}
 	ret = mkbd_push();
 	mutex_unlock(&ec_lock);
+	mutex_unlock(&cdev->led_access);
 
 	return ret ? ret : count;
 }
@@ -288,8 +325,9 @@ ATTRIBUTE_GROUPS(mkbd);
 
 static int __init monster_kbd_init(void)
 {
-	u8 feat;
-	int ret;
+	struct led_classdev *cdev = &mkbd_mc.led_cdev;
+	u8 feat, rgb[3];
+	int i, ret;
 
 	if (!dmi_check_system(mkbd_dmi_table)) {
 		if (!force) {
@@ -306,13 +344,18 @@ static int __init monster_kbd_init(void)
 	ret = ec_rd(EC_FEATURE, &feat);
 	/* current EC color becomes the base color, brightness = full */
 	if (!ret)
-		ret = ec_rd(EC_KBD_R, &base_rgb[0]);
+		ret = ec_rd(EC_KBD_R, &rgb[0]);
 	if (!ret)
-		ret = ec_rd(EC_KBD_G, &base_rgb[1]);
+		ret = ec_rd(EC_KBD_G, &rgb[1]);
 	if (!ret)
-		ret = ec_rd(EC_KBD_B, &base_rgb[2]);
+		ret = ec_rd(EC_KBD_B, &rgb[2]);
 	if (!ret) {
-		memcpy(hw_rgb, base_rgb, sizeof(hw_rgb));
+		for (i = 0; i < 3; i++) {
+			rgb[i] = min_t(u8, rgb[i], KBD_CH_MAX);
+			intens[i] = DIV_ROUND_CLOSEST(rgb[i] * MC_MAX, KBD_CH_MAX);
+			mkbd_subleds[i].intensity = intens[i];
+		}
+		memcpy(hw_rgb, rgb, sizeof(hw_rgb));
 		hw_valid = true;
 	}
 	mutex_unlock(&ec_lock);
@@ -328,28 +371,28 @@ static int __init monster_kbd_init(void)
 	if (IS_ERR(mkbd_pdev))
 		return PTR_ERR(mkbd_pdev);
 
-	mkbd_led.name = "monster::kbd_backlight";
-	mkbd_led.max_brightness = SW_MAX;
-	mkbd_led.brightness = SW_MAX;
-	mkbd_led.brightness_set_blocking = mkbd_brightness_set;
-	mkbd_led.groups = mkbd_groups;
+	cdev->name = "monster::kbd_backlight";
+	cdev->max_brightness = MC_MAX;
+	cdev->brightness = MC_MAX;
+	cdev->brightness_set_blocking = mkbd_brightness_set;
+	cdev->groups = mkbd_groups;
 	/* keep the light as-is on rmmod instead of forcing it off */
-	mkbd_led.flags = LED_RETAIN_AT_SHUTDOWN;
+	cdev->flags = LED_RETAIN_AT_SHUTDOWN;
 
-	ret = led_classdev_register(&mkbd_pdev->dev, &mkbd_led);
+	ret = led_classdev_multicolor_register(&mkbd_pdev->dev, &mkbd_mc);
 	if (ret) {
 		platform_device_unregister(mkbd_pdev);
 		return ret;
 	}
 
-	pr_info("monster_kbd: loaded, base color %u %u %u\n",
-		base_rgb[0], base_rgb[1], base_rgb[2]);
+	pr_info("monster_kbd: loaded as multicolor LED, color %u %u %u\n",
+		rgb[0], rgb[1], rgb[2]);
 	return 0;
 }
 
 static void __exit monster_kbd_exit(void)
 {
-	led_classdev_unregister(&mkbd_led);
+	led_classdev_multicolor_unregister(&mkbd_mc);
 	platform_device_unregister(mkbd_pdev);
 }
 

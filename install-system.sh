@@ -12,9 +12,11 @@ echo "== 1/5 dkms"
 command -v dkms >/dev/null || apt-get install -y dkms
 
 echo "== 2/5 driver -> /usr/src/monster-kbd-$VER (DKMS)"
-if dkms status "monster-kbd/$VER" 2>/dev/null | grep -q monster-kbd; then
-	dkms remove "monster-kbd/$VER" --all
-fi
+# remove any installed version (upgrades included)
+for old in $(dkms status monster-kbd 2>/dev/null | sed -n 's#^monster-kbd/\([^,:]*\).*#\1#p' | sort -u); do
+	dkms remove "monster-kbd/$old" --all || true
+	rm -rf "/usr/src/monster-kbd-$old"
+done
 rm -rf "/usr/src/monster-kbd-$VER"
 install -d "/usr/src/monster-kbd-$VER"
 install -m644 "$HERE"/driver/{monster_kbd.c,Makefile,dkms.conf} "/usr/src/monster-kbd-$VER/"
@@ -39,6 +41,9 @@ install -m644 "$HERE/systemd/monster-kbd-fx@.service" /usr/local/lib/systemd/use
 
 echo "== 5/5 load driver"
 rmmod monster_kbd 2>/dev/null || true
+# brightness scale changed in 1.1 (0..10 -> 0..255): drop the value
+# systemd-backlight saved for the old scale so it is not restored as "dim"
+rm -f /var/lib/systemd/backlight/*monster::kbd_backlight* 2>/dev/null || true
 if ! modprobe monster_kbd; then
 	echo "driver did not load: see 'sudo dmesg | grep monster_kbd'"
 	exit 1
